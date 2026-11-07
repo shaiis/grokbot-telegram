@@ -513,6 +513,74 @@ describe("voice and audio delivery", () => {
     expect(await mismatchResponse.json()).toEqual({ ok: false, error: "media_type_rejected", reason: "magic_rejected" });
   });
 
+  it("calls fetch as a function so workerd does not throw Illegal invocation", async () => {
+    const inner = scripted((call) => {
+      if (call.url.endsWith("/getFile")) {
+        return Response.json({ ok: true, result: { file_path: "voice/file_36.oga", file_size: OGG.byteLength } });
+      }
+      return new Response(OGG, {
+        status: 200,
+        headers: { "content-type": "application/octet-stream", "content-length": String(OGG.byteLength) },
+      });
+    });
+    const fetchImpl: typeof fetch = function (this: unknown, input, init) {
+      if (this !== undefined && this !== globalThis) {
+        throw new TypeError("Illegal invocation: function called with incorrect `this` reference.");
+      }
+      return inner.fetchImpl(input, init);
+    };
+    const app = createTestApp({ fetchImpl });
+    await postUpdate(app.deps, app.tasks, voiceUpdate({}, 23));
+    const payload = inner.calls.find((call) => call.url.startsWith("https://grok.example/hook"))?.body as WakeEvent;
+    const response = await authedGet(app.deps, itemOf(payload).download_url ?? "", payload.reply.token);
+    expect(response.status).toBe(200);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(OGG);
+  });
+
+  it("retries one dropped file connection and does not retry a bad content-length", async () => {
+    let fileGets = 0;
+    const reset = scripted((call) => {
+      if (call.url.endsWith("/getFile")) {
+        return Response.json({ ok: true, result: { file_path: "voice/file_36.oga", file_size: OGG.byteLength } });
+      }
+      fileGets += 1;
+      if (fileGets === 1) throw new Error("Network connection lost.");
+      return new Response(OGG, {
+        status: 200,
+        headers: { "content-type": "application/octet-stream", "content-length": String(OGG.byteLength) },
+      });
+    });
+    const app = createTestApp({ fetchImpl: reset.fetchImpl });
+    await postUpdate(app.deps, app.tasks, voiceUpdate({}, 21));
+    const payload = reset.calls.find((call) => call.url.startsWith("https://grok.example/hook"))?.body as WakeEvent;
+    const response = await authedGet(app.deps, itemOf(payload).download_url ?? "", payload.reply.token);
+    expect(response.status).toBe(200);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(OGG);
+    expect(fileGets).toBe(2);
+
+    let rejectedGets = 0;
+    const rejected = scripted((call) => {
+      if (call.url.endsWith("/getFile")) {
+        return Response.json({ ok: true, result: { file_path: "voice/file_36.oga", file_size: OGG.byteLength } });
+      }
+      rejectedGets += 1;
+      throw new Error("invalid Content-Length header value; cl = 12, 12");
+    });
+    const rejectedApp = createTestApp({ fetchImpl: rejected.fetchImpl });
+    const logs: Record<string, unknown>[] = [];
+    rejectedApp.deps.log = (event) => logs.push(event);
+    await postUpdate(rejectedApp.deps, rejectedApp.tasks, voiceUpdate({}, 22));
+    const rejectedPayload = rejected.calls.find((call) => call.url.startsWith("https://grok.example/hook"))?.body as WakeEvent;
+    const rejectedResponse = await authedGet(rejectedApp.deps, itemOf(rejectedPayload).download_url ?? "", rejectedPayload.reply.token);
+    expect(rejectedResponse.status).toBe(502);
+    const rejectedBody = await rejectedResponse.text();
+    expect(JSON.parse(rejectedBody)).toEqual({ ok: false, error: "media_fetch_failed", reason: "download_bad_content_length" });
+    expect(rejectedBody).not.toContain("cl =");
+    expect(rejectedGets).toBe(1);
+    expect(JSON.stringify(logs)).toContain("download_bad_content_length");
+    expect(JSON.stringify(logs)).not.toContain("invalid Content-Length");
+  });
+
   it("returns a bounded error when Telegram cannot be reached", async () => {
     const mock = createFetchMock((call) => {
       if (call.url.endsWith("/getFile")) throw new TypeError("connect ECONNREFUSED https://api.telegram.org/bot123456:ABCDEFghij/getFile");

@@ -116,7 +116,8 @@ export async function handleMediaDownload(request: Request, deps: AppDeps, media
     fetchImpl: deps.fetchImpl,
   });
   if (!fetched.ok) {
-    if (fetched.reason === "too_large" || fetched.reason === "type_rejected") {
+    const reason = mediaFailureReason(fetched.failure);
+    if (reason === "too_large" || reason === "mime_rejected" || reason === "magic_rejected") {
       await deps.store.deleteMedia(claims.chat_id, mediaId).catch(() => undefined);
     }
     deps.log({
@@ -124,11 +125,13 @@ export async function handleMediaDownload(request: Request, deps: AppDeps, media
       chat_id: claims.chat_id,
       wake_id: claims.wake_id,
       media_id: mediaId,
-      error: fetched.reason,
+      reason,
     });
-    if (fetched.reason === "too_large") return json(413, { ok: false, error: "media_too_large" });
-    if (fetched.reason === "type_rejected") return json(415, { ok: false, error: "media_type_rejected" });
-    return json(502, { ok: false, error: "media_fetch_failed" });
+    if (reason === "too_large") return json(413, { ok: false, error: "media_too_large", reason });
+    if (reason === "mime_rejected" || reason === "magic_rejected") {
+      return json(415, { ok: false, error: "media_type_rejected", reason });
+    }
+    return json(502, { ok: false, error: "media_fetch_failed", reason });
   }
 
   deps.log({
@@ -264,7 +267,44 @@ function safeDisplayName(value: unknown): string | null {
   return cleaned;
 }
 
-type FetchFailure = "too_large" | "type_rejected" | "unreachable" | "redirect" | "bad_path" | "rejected" | "not_configured" | "empty";
+/** Codes safe to put in a client response and a log line. No token, file URL, or file id. */
+type MediaFailureCode =
+  | "too_large"
+  | "mime_rejected"
+  | "magic_rejected"
+  | "getfile_redirect"
+  | "download_redirect"
+  | "getfile_unreachable"
+  | "download_unreachable"
+  | "bad_path"
+  | "getfile_bad_response"
+  | "getfile_bad_size"
+  | "empty"
+  | "not_configured"
+  | "download_bad_length"
+  | "download_stream_error"
+  | "bad_file_id";
+
+type MediaFailure = { code: MediaFailureCode } | { code: "getfile_http" | "download_http"; status: number };
+
+type DownloadResult = { ok: true; bytes: Uint8Array; mime: string } | { ok: false; failure: MediaFailure };
+
+function failed(code: MediaFailureCode): { ok: false; failure: MediaFailure } {
+  return { ok: false, failure: { code } };
+}
+
+function failedHttp(code: "getfile_http" | "download_http", status: number): { ok: false; failure: MediaFailure } {
+  const safe = Number.isInteger(status) && status >= 100 && status <= 599 ? status : 0;
+  return { ok: false, failure: { code, status: safe } };
+}
+
+/** Stable reason string. HTTP statuses are only three digits, never status text. */
+function mediaFailureReason(failure: MediaFailure): string {
+  if (failure.code === "getfile_http" || failure.code === "download_http") {
+    return `${failure.code}_${failure.status}`;
+  }
+  return failure.code;
+}
 
 async function downloadTelegramAudio(options: {
   token: string;
@@ -272,14 +312,14 @@ async function downloadTelegramAudio(options: {
   declaredMime: string | null;
   maxBytes: number;
   fetchImpl: typeof fetch;
-}): Promise<{ ok: true; bytes: Uint8Array; mime: string } | { ok: false; reason: FetchFailure }> {
-  if (!isTelegramFileId(options.fileId)) return { ok: false, reason: "bad_path" };
+}): Promise<DownloadResult> {
+  if (!isTelegramFileId(options.fileId)) return failed("bad_file_id");
   const meta = await telegramGetFile(options.fetchImpl, options.token, options.fileId);
   if (!meta.ok) return meta;
-  if (meta.fileSize !== null && meta.fileSize > options.maxBytes) return { ok: false, reason: "too_large" };
+  if (meta.fileSize !== null && meta.fileSize > options.maxBytes) return failed("too_large");
   const path = sanitizeTelegramFilePath(meta.filePath);
   const url = path ? telegramFileUrl(options.token, path) : null;
-  if (!url) return { ok: false, reason: "bad_path" };
+  if (!url) return failed("bad_path");
   let response: Response;
   try {
     response = await options.fetchImpl(url, {
@@ -288,26 +328,26 @@ async function downloadTelegramAudio(options: {
       signal: AbortSignal.timeout(20_000),
     });
   } catch {
-    return { ok: false, reason: "unreachable" };
+    return failed("download_unreachable");
   }
   if (response.status >= 300 && response.status < 400) {
     await response.body?.cancel().catch(() => undefined);
-    return { ok: false, reason: "redirect" };
+    return failed("download_redirect");
   }
   if (!response.ok) {
     await response.body?.cancel().catch(() => undefined);
-    return { ok: false, reason: "rejected" };
+    return failedHttp("download_http", response.status);
   }
   if (!headerAllowsAudio(response.headers.get("content-type"))) {
     await response.body?.cancel().catch(() => undefined);
-    return { ok: false, reason: "type_rejected" };
+    return failed("mime_rejected");
   }
   const body = await readCappedBody(response, options.maxBytes);
   if (!body.ok) return body;
   const sniffed = sniffAudio(body.bytes);
-  if (!sniffed) return { ok: false, reason: "type_rejected" };
+  if (!sniffed) return failed("magic_rejected");
   if (options.declaredMime && family(options.declaredMime) !== family(sniffed)) {
-    return { ok: false, reason: "type_rejected" };
+    return failed("magic_rejected");
   }
   return { ok: true, bytes: body.bytes, mime: sniffed };
 }
@@ -316,9 +356,9 @@ async function telegramGetFile(
   fetchImpl: typeof fetch,
   token: string,
   fileId: string,
-): Promise<{ ok: true; filePath: string; fileSize: number | null } | { ok: false; reason: FetchFailure }> {
+): Promise<{ ok: true; filePath: string; fileSize: number | null } | { ok: false; failure: MediaFailure }> {
   const url = telegramMethodUrl(token, "getFile");
-  if (!url) return { ok: false, reason: "not_configured" };
+  if (!url) return failed("not_configured");
   let response: Response;
   try {
     response = await fetchImpl(url, {
@@ -329,32 +369,33 @@ async function telegramGetFile(
       signal: AbortSignal.timeout(10_000),
     });
   } catch {
-    return { ok: false, reason: "unreachable" };
+    return failed("getfile_unreachable");
   }
   if (response.status >= 300 && response.status < 400) {
     await response.body?.cancel().catch(() => undefined);
-    return { ok: false, reason: "redirect" };
+    return failed("getfile_redirect");
   }
   const json: unknown = await response.json().catch(() => null);
-  if (!response.ok || !json || typeof json !== "object") {
+  if (!response.ok) {
     const description = json && typeof json === "object" ? String((json as { description?: unknown }).description ?? "") : "";
     await response.body?.cancel().catch(() => undefined);
-    if (/too big|too large/i.test(description)) return { ok: false, reason: "too_large" };
-    return { ok: false, reason: "rejected" };
+    if (/too big|too large/i.test(description)) return failed("too_large");
+    return failedHttp("getfile_http", response.status);
   }
+  if (!json || typeof json !== "object") return failed("getfile_bad_response");
   const record = json as { ok?: unknown; result?: unknown; description?: unknown };
   if (record.ok !== true || !record.result || typeof record.result !== "object") {
     const description = typeof record.description === "string" ? record.description : "";
-    if (/too big|too large/i.test(description)) return { ok: false, reason: "too_large" };
-    return { ok: false, reason: "rejected" };
+    if (/too big|too large/i.test(description)) return failed("too_large");
+    return failed("getfile_bad_response");
   }
   const result = record.result as { file_path?: unknown; file_size?: unknown };
-  if (typeof result.file_path !== "string") return { ok: false, reason: "bad_path" };
+  if (typeof result.file_path !== "string") return failed("bad_path");
   if (result.file_size === undefined || result.file_size === null) {
     return { ok: true, filePath: result.file_path, fileSize: null };
   }
   if (typeof result.file_size !== "number" || !Number.isSafeInteger(result.file_size) || result.file_size < 1) {
-    return { ok: false, reason: "rejected" };
+    return failed("getfile_bad_size");
   }
   return { ok: true, filePath: result.file_path, fileSize: result.file_size };
 }
@@ -387,28 +428,28 @@ function headerAllowsAudio(header: string | null): boolean {
 async function readCappedBody(
   response: Response,
   maxBytes: number,
-): Promise<{ ok: true; bytes: Uint8Array } | { ok: false; reason: "too_large" | "empty" | "rejected" }> {
+): Promise<{ ok: true; bytes: Uint8Array } | { ok: false; failure: MediaFailure }> {
   const declared = response.headers.get("content-length");
   if (declared !== null && declared !== "") {
     if (!/^\d+$/.test(declared)) {
       await response.body?.cancel().catch(() => undefined);
-      return { ok: false, reason: "rejected" };
+      return failed("download_bad_length");
     }
     const length = Number(declared);
     if (!Number.isSafeInteger(length)) {
       await response.body?.cancel().catch(() => undefined);
-      return { ok: false, reason: "rejected" };
+      return failed("download_bad_length");
     }
     if (length === 0) {
       await response.body?.cancel().catch(() => undefined);
-      return { ok: false, reason: "empty" };
+      return failed("empty");
     }
     if (length > maxBytes) {
       await response.body?.cancel().catch(() => undefined);
-      return { ok: false, reason: "too_large" };
+      return failed("too_large");
     }
   }
-  if (!response.body) return { ok: false, reason: "empty" };
+  if (!response.body) return failed("empty");
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -421,18 +462,18 @@ async function readCappedBody(
       value = next.value;
     } catch {
       await reader.cancel().catch(() => undefined);
-      return { ok: false, reason: "rejected" };
+      return failed("download_stream_error");
     }
     if (done) break;
     if (!value) continue;
     total += value.byteLength;
     if (total > maxBytes) {
       await reader.cancel().catch(() => undefined);
-      return { ok: false, reason: "too_large" };
+      return failed("too_large");
     }
     chunks.push(value);
   }
-  if (total === 0) return { ok: false, reason: "empty" };
+  if (total === 0) return failed("empty");
   const bytes = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {

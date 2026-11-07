@@ -1,6 +1,9 @@
 name = "grokbot-telegram"
 main = "src/adapters/cloudflare/worker.ts"
 compatibility_date = "2026-01-15"
+# Dashboard plain-text vars are not in this file. Without this, `wrangler deploy`
+# (including Workers Builds on main) deletes them. Secrets are never deleted.
+keep_vars = true
 
 [[durable_objects.bindings]]
 name = "CHAT_SESSION"

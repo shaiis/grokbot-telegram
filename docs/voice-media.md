@@ -104,16 +104,40 @@ Send the transcript back with `"final": true` only after that cleanup. A progres
 | 403 | `not_allowlisted` | The sender or chat is no longer allowlisted. |
 | 404 | `media_not_found` | Unknown id, another chat, another wake, or the grant expired. |
 | 404 | `not_found` | The request host is not `PUBLIC_BASE_URL`. |
-| 413 | `media_too_large` | Telegram reported, or the stream exceeded, the size cap. |
-| 415 | `media_type_rejected` | The bytes are not a matching audio type. |
-| 502 | `media_fetch_failed` | Telegram could not be used. The body has no token, file id, or upstream URL. |
+| 413 | `media_too_large` | Telegram reported, or the stream exceeded, the size cap. `reason` is `too_large`. |
+| 415 | `media_type_rejected` | The response type or the bytes were refused. `reason` is `mime_rejected` or `magic_rejected`. |
+| 502 | `media_fetch_failed` | Telegram could not be used. `reason` says which step failed. The body has no token, file id, file path, or upstream URL. |
 | 405 | `method_not_allowed` | Only `GET` downloads. |
 
 An outbound API key cannot download media. The bearer is the wake's reply token.
 
+`reason` is also written as one JSON log line (`event` `media_download_failed`) with the chat, wake, and bridge media id. It never includes the bot token, the Telegram file URL, or the Telegram `file_id`.
+
+| `reason` | Meaning |
+| --- | --- |
+| `too_large` | Declared size or the stream is over the cap. |
+| `mime_rejected` | The download `content-type` is not audio, `application/ogg`, or `application/octet-stream`. |
+| `magic_rejected` | The bytes are not a known audio file, or they disagree with the voice `mime_type`. |
+| `getfile_http_<status>` | `getFile` returned that HTTP status. `<status>` is three digits. |
+| `download_http_<status>` | The file download returned that HTTP status. |
+| `getfile_redirect`, `download_redirect` | Telegram answered with a redirect. It is not followed. |
+| `getfile_unreachable`, `download_unreachable` | The fetch threw before a status was available. |
+| `getfile_bad_response` | `getFile` returned 2xx without a File object. |
+| `getfile_bad_size` | `file_size` was present and not a positive integer. |
+| `bad_path` | `file_path` was not a relative Telegram path. |
+| `bad_file_id` | The stored `file_id` failed the same check used when the grant was saved. |
+| `empty` | The download body was empty. |
+| `download_bad_length` | `content-length` was not a plain integer. |
+| `download_stream_error` | The body stream failed while it was read. |
+| `not_configured` | The bot token is missing or not a Telegram token. |
+
+`application/octet-stream` with a body that starts `OggS`, including a `voice/file_N.oga` path and a missing `content-length`, is a successful voice download. A non-2xx JSON body from Telegram stays a `getfile_http_<status>` or `download_http_<status>` failure and is not sniffed as audio.
+
 ## Deploy and roll back
 
 Do not deploy until the parent has reviewed this change. Deploying uploads the Worker script only. It does not rotate secrets, and this branch does not change Durable Object classes or migrations (`wrangler.toml` stays on tag `v1`). Do not edit that migration, the `ChatSession` class name, or the `CHAT_SESSION` binding. Do not run `wrangler delete`, `wrangler secret delete`, or `wrangler deploy --secrets-file`.
+
+`wrangler.toml` sets `keep_vars = true`. Wrangler otherwise deletes plain-text variables that exist only in the Cloudflare dashboard, including `ALLOWLIST_CHAT_IDS`, `PUBLIC_BASE_URL`, `TELEGRAM_BOT_USERNAME`, and `GROK_WEBHOOK_URL`. Secrets survive a deploy either way. Keep those values in the dashboard (or in the host's secret store). Do not commit them. A deploy with `keep_vars` does not put back variables that an earlier deploy already removed; set those again in the dashboard if `/healthz` or the allowlist shows them missing.
 
 From a checkout of the reviewed revision, with Wrangler already logged in as the account that owns the Worker:
 
@@ -133,6 +157,6 @@ After a rollback, new wakes no longer include `media_items`. `/send` and typing 
 
 ## What was verified here
 
-Verified with Vitest against a mocked Telegram `getFile` and file download: text wakes unchanged, a voice wake's download contract, Durable Object grant storage, the Vercel `/media/:id` path, expired and finalized tokens, wrong chat, topic, wake, and media id, allowlist removal, size and duration caps, missing and oversized content length, MIME and magic-byte rejection, redirect and path refusal, and transport errors that do not echo secrets.
+Verified with Vitest against a mocked Telegram `getFile` and file download: text wakes unchanged, a voice wake's download contract, a realistic voice response (`voice/file_N.oga`, `application/octet-stream`, body starting `OggS`, with and without `content-length`), Durable Object grant storage, the Vercel `/media/:id` path, expired and finalized tokens, wrong chat, topic, wake, and media id, allowlist removal, size and duration caps, missing and oversized content length, MIME and magic-byte rejection, redirect and path refusal, HTTP status reason codes, and transport errors that do not echo secrets.
 
 Not done from this environment: no request to the production Worker, no live Telegram voice note, no call to `/workspace/telegram-voice-test/run.sh` (that runner is on the bot computer and is not in this VM).

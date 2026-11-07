@@ -81,6 +81,8 @@ npx wrangler login
 npx wrangler deploy
 ```
 
+`wrangler.toml` sets `keep_vars = true`, so a deploy keeps plain-text variables entered in the Cloudflare dashboard. Without it, Wrangler deletes dashboard variables that are not listed in the config. Secrets are not deleted either way. Leave `ALLOWLIST_CHAT_IDS`, `PUBLIC_BASE_URL`, `TELEGRAM_BOT_USERNAME`, and `GROK_WEBHOOK_URL` out of the repo.
+
 Write the `workers.dev` origin Wrangler prints into `PUBLIC_BASE_URL` in `.env`. Remove any trailing slash. Then:
 
 ```bash

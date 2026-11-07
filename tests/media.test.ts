@@ -5,6 +5,7 @@ import worker from "../src/adapters/cloudflare/worker.js";
 import { resetVercelShared, vercelFetch } from "../src/adapters/vercel/handler.js";
 import { signReplyToken } from "../src/core/crypto.js";
 import { handleRequest } from "../src/core/handler.js";
+import { createLogger } from "../src/core/log.js";
 import { sanitizeTelegramFilePath, sniffAudio } from "../src/core/media.js";
 import type { MediaItem, WakeEvent } from "../src/core/types.js";
 import {
@@ -420,7 +421,7 @@ describe("voice and audio delivery", () => {
     const declaredPayload = overDeclared.calls.find((call) => call.url.startsWith("https://grok.example/hook"))?.body as WakeEvent;
     const declared = await authedGet(declaredApp.deps, itemOf(declaredPayload).download_url ?? "", declaredPayload.reply.token);
     expect(declared.status).toBe(413);
-    expect(await declared.json()).toEqual({ ok: false, error: "media_too_large" });
+    expect(await declared.json()).toEqual({ ok: false, error: "media_too_large", reason: "too_large" });
     expect(overDeclared.calls.some((call) => call.url.includes("/file/bot"))).toBe(false);
 
     const streamed = scripted((call) => {
@@ -470,6 +471,7 @@ describe("voice and audio delivery", () => {
     expect(redirectResponse.status).toBe(502);
     const redirectBody = await redirectResponse.text();
     expect(redirectBody).toContain("media_fetch_failed");
+    expect(redirectBody).toContain("download_redirect");
     expect(redirectBody).not.toContain("169.254");
     expect(redirectBody).not.toContain(BOT_TOKEN);
     expect(redirected.calls.some((call) => call.url.includes("169.254"))).toBe(false);
@@ -496,7 +498,7 @@ describe("voice and audio delivery", () => {
     const htmlPayload = html.calls.find((call) => call.url.startsWith("https://grok.example/hook"))?.body as WakeEvent;
     const htmlResponse = await authedGet(htmlApp.deps, itemOf(htmlPayload).download_url ?? "", htmlPayload.reply.token);
     expect(htmlResponse.status).toBe(415);
-    expect(await htmlResponse.json()).toEqual({ ok: false, error: "media_type_rejected" });
+    expect(await htmlResponse.json()).toEqual({ ok: false, error: "media_type_rejected", reason: "mime_rejected" });
 
     const mismatch = scripted((call) => {
       if (call.url.endsWith("/getFile")) return Response.json({ ok: true, result: { file_path: "voice/file_1.oga", file_size: 4 } });
@@ -506,7 +508,9 @@ describe("voice and audio delivery", () => {
     const mismatchApp = createTestApp({ fetchImpl: mismatch.fetchImpl });
     await postUpdate(mismatchApp.deps, mismatchApp.tasks, voiceUpdate({}, 14));
     const mismatchPayload = mismatch.calls.find((call) => call.url.startsWith("https://grok.example/hook"))?.body as WakeEvent;
-    expect((await authedGet(mismatchApp.deps, itemOf(mismatchPayload).download_url ?? "", mismatchPayload.reply.token)).status).toBe(415);
+    const mismatchResponse = await authedGet(mismatchApp.deps, itemOf(mismatchPayload).download_url ?? "", mismatchPayload.reply.token);
+    expect(mismatchResponse.status).toBe(415);
+    expect(await mismatchResponse.json()).toEqual({ ok: false, error: "media_type_rejected", reason: "magic_rejected" });
   });
 
   it("returns a bounded error when Telegram cannot be reached", async () => {
@@ -522,12 +526,149 @@ describe("voice and audio delivery", () => {
     const response = await authedGet(app.deps, itemOf(payload).download_url ?? "", payload.reply.token);
     expect(response.status).toBe(502);
     const body = await response.text();
-    expect(body).toBe('{"ok":false,"error":"media_fetch_failed"}');
+    expect(JSON.parse(body)).toEqual({ ok: false, error: "media_fetch_failed", reason: "getfile_unreachable" });
     expect(body).not.toContain(BOT_TOKEN);
     expect(body).not.toContain("ECONNREFUSED");
     expect(body).not.toContain(FILE_ID);
+    expect(logs).toContainEqual({
+      event: "media_download_failed",
+      chat_id: "42",
+      wake_id: payload.reply.wake_id,
+      media_id: itemOf(payload).id,
+      reason: "getfile_unreachable",
+    });
+    const lines: string[] = [];
+    createLogger([BOT_TOKEN], (line) => lines.push(line))({
+      event: "media_download_failed",
+      chat_id: "42",
+      wake_id: payload.reply.wake_id,
+      media_id: itemOf(payload).id,
+      reason: "getfile_unreachable",
+      file_id: FILE_ID,
+      note: `https://api.telegram.org/file/bot${BOT_TOKEN}/voice/file_1.oga`,
+    });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("\"reason\":\"getfile_unreachable\"");
+    expect(lines[0]).not.toContain(BOT_TOKEN);
+    expect(lines[0]).not.toContain(FILE_ID);
+    expect(lines[0]).not.toContain("voice/file_1.oga");
     expect(JSON.stringify(logs)).not.toContain(BOT_TOKEN);
     expect(JSON.stringify(logs)).not.toContain(FILE_ID);
+  });
+
+  it("serves a realistic Telegram voice note and names the upstream HTTP status", async () => {
+    const fileId = "AwACAgQAAxkBAAIFKWfPCSN82kPw7sqAG-_9E6z9orxgAALRHwAC0Tl4Uj7NUibkOW-wNgQ";
+    const bytes = Uint8Array.from([0x4f, 0x67, 0x67, 0x53, 0x00, 0x02, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05]);
+    const described = `Bad Request: wrong file identifier ${fileId} at voice/file_36.oga`;
+    const realistic = scripted((call) => {
+      if (call.url.endsWith("/getFile")) {
+        return Response.json({
+          ok: true,
+          result: {
+            file_id: fileId,
+            file_unique_id: "AgAD0R8AAtE5eFI",
+            file_size: bytes.byteLength,
+            file_path: "voice/file_36.oga",
+          },
+        });
+      }
+      return new Response(bytes, {
+        status: 200,
+        headers: { "content-type": "application/octet-stream" },
+      });
+    });
+    const app = createTestApp({ fetchImpl: realistic.fetchImpl });
+    const logs: Record<string, unknown>[] = [];
+    app.deps.log = (event) => logs.push(event);
+    await postUpdate(app.deps, app.tasks, voiceUpdate({ file_id: fileId, file_size: bytes.byteLength, mime_type: "audio/ogg" }, 16));
+    const payload = realistic.calls.find((call) => call.url.startsWith("https://grok.example/hook"))?.body as WakeEvent;
+    const response = await authedGet(app.deps, itemOf(payload).download_url ?? "", payload.reply.token);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("audio/ogg");
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
+    const fileCall = realistic.calls.find((call) => call.url.includes("/file/bot"));
+    expect(fileCall?.url).toBe(`https://api.telegram.org/file/bot${BOT_TOKEN}/voice/file_36.oga`);
+    expect(realistic.calls.find((call) => call.url.endsWith("/getFile"))?.body).toEqual({ file_id: fileId });
+    expect(JSON.stringify(logs)).not.toContain(fileId);
+    expect(JSON.stringify(payload)).not.toContain(fileId);
+
+    const withLength = scripted((call) => {
+      if (call.url.endsWith("/getFile")) {
+        return Response.json({ ok: true, result: { file_path: "voice/file_36.oga", file_size: bytes.byteLength } });
+      }
+      return new Response(bytes, {
+        status: 200,
+        headers: {
+          "content-type": "application/octet-stream; charset=binary",
+          "content-length": String(bytes.byteLength),
+        },
+      });
+    });
+    const lengthApp = createTestApp({ fetchImpl: withLength.fetchImpl });
+    await postUpdate(lengthApp.deps, lengthApp.tasks, voiceUpdate({ file_id: fileId, file_size: bytes.byteLength }, 17));
+    const lengthPayload = withLength.calls.find((call) => call.url.startsWith("https://grok.example/hook"))?.body as WakeEvent;
+    const lengthResponse = await authedGet(lengthApp.deps, itemOf(lengthPayload).download_url ?? "", lengthPayload.reply.token);
+    expect(lengthResponse.status).toBe(200);
+    expect(new Uint8Array(await lengthResponse.arrayBuffer())).toEqual(bytes);
+
+    const missing = scripted((call) => {
+      if (call.url.endsWith("/getFile")) {
+        return Response.json({
+          ok: false,
+          error_code: 400,
+          description: described,
+        }, { status: 400 });
+      }
+      return new Response("no", { status: 500 });
+    });
+    const missingApp = createTestApp({ fetchImpl: missing.fetchImpl });
+    const missingLogs: Record<string, unknown>[] = [];
+    missingApp.deps.log = (event) => missingLogs.push(event);
+    await postUpdate(missingApp.deps, missingApp.tasks, voiceUpdate({ file_id: fileId }, 18));
+    const missingPayload = missing.calls.find((call) => call.url.startsWith("https://grok.example/hook"))?.body as WakeEvent;
+    const missingResponse = await authedGet(missingApp.deps, itemOf(missingPayload).download_url ?? "", missingPayload.reply.token);
+    expect(missingResponse.status).toBe(502);
+    const missingBody = await missingResponse.text();
+    expect(JSON.parse(missingBody)).toEqual({ ok: false, error: "media_fetch_failed", reason: "getfile_http_400" });
+    expect(missingBody).not.toContain(fileId);
+    expect(missingBody).not.toContain("voice/file_36.oga");
+    expect(missingBody).not.toContain(described);
+    expect(missing.calls.some((call) => call.url.includes("/file/bot"))).toBe(false);
+    expect(JSON.stringify(missingLogs)).toContain("getfile_http_400");
+    expect(JSON.stringify(missingLogs)).not.toContain(fileId);
+    expect(JSON.stringify(missingLogs)).not.toContain("voice/");
+
+    const notFound = scripted((call) => {
+      if (call.url.endsWith("/getFile")) {
+        return Response.json({ ok: true, result: { file_path: "voice/file_36.oga", file_size: 55 } });
+      }
+      return new Response(JSON.stringify({ ok: false, error_code: 404, description: "Not Found" }), {
+        status: 404,
+        headers: { "content-type": "application/json", "content-length": "55" },
+      });
+    });
+    const notFoundApp = createTestApp({ fetchImpl: notFound.fetchImpl });
+    await postUpdate(notFoundApp.deps, notFoundApp.tasks, voiceUpdate({ file_id: fileId }, 19));
+    const notFoundPayload = notFound.calls.find((call) => call.url.startsWith("https://grok.example/hook"))?.body as WakeEvent;
+    const notFoundResponse = await authedGet(notFoundApp.deps, itemOf(notFoundPayload).download_url ?? "", notFoundPayload.reply.token);
+    expect(notFoundResponse.status).toBe(502);
+    expect(await notFoundResponse.json()).toEqual({ ok: false, error: "media_fetch_failed", reason: "download_http_404" });
+
+    const disguised = scripted((call) => {
+      if (call.url.endsWith("/getFile")) {
+        return Response.json({ ok: true, result: { file_path: "voice/file_36.oga", file_size: 16 } });
+      }
+      return new Response('{"ok":false}', {
+        status: 200,
+        headers: { "content-type": "application/octet-stream", "content-length": "16" },
+      });
+    });
+    const disguisedApp = createTestApp({ fetchImpl: disguised.fetchImpl });
+    await postUpdate(disguisedApp.deps, disguisedApp.tasks, voiceUpdate({ file_id: fileId }, 20));
+    const disguisedPayload = disguised.calls.find((call) => call.url.startsWith("https://grok.example/hook"))?.body as WakeEvent;
+    const disguisedResponse = await authedGet(disguisedApp.deps, itemOf(disguisedPayload).download_url ?? "", disguisedPayload.reply.token);
+    expect(disguisedResponse.status).toBe(415);
+    expect(await disguisedResponse.json()).toEqual({ ok: false, error: "media_type_rejected", reason: "magic_rejected" });
   });
 
   it("answers POST and a non-id path without downloading", async () => {

@@ -10,7 +10,7 @@ import {
 } from "../../core/typing.js";
 import { createTelegramClient } from "../../core/telegram.js";
 import { collectSecrets, createLogger } from "../../core/log.js";
-import { freshContext, normalizeSendRecord, type SendRecord } from "../../core/store.js";
+import { copyMediaGrant, freshContext, normalizeSendRecord, type MediaGrant, type SendRecord } from "../../core/store.js";
 import type { ContextMessage, TypingScope, TypingStart } from "../../core/types.js";
 
 export interface DoStorage {
@@ -45,6 +45,8 @@ interface DoOp {
   wakeId?: string | null;
   sendKey?: string;
   record?: SendRecord;
+  mediaId?: string;
+  grant?: unknown;
 }
 
 export async function handleDoFetch(
@@ -90,6 +92,15 @@ export async function handleDoFetch(
     case "send.release":
       if (body.sendKey) await storage.delete(`send:${body.sendKey}`);
       return Response.json({ ok: true });
+    case "media.put":
+      return Response.json(await mediaPut(storage, body));
+    case "media.get":
+      return Response.json(await mediaGet(storage, body));
+    case "media.delete":
+      if (body.mediaId) await storage.delete(`mediagrant:${body.mediaId}`);
+      return Response.json({ ok: true });
+    case "media.deleteWake":
+      return Response.json(await mediaDeleteWake(storage, body));
     default:
       return Response.json({ ok: false, error: "unknown_op" }, { status: 400 });
   }
@@ -330,6 +341,61 @@ async function sendClaim(storage: DoStorage, body: DoOp): Promise<{ claimed: boo
   await storage.put<StoredSend>(key, { until: now + (body.ttlMs ?? 3_600_000), record: { state: "pending", message_ids: [] } });
   await pruneExpired(storage, "send:", now);
   return { claimed: true };
+}
+
+interface MediaIndex {
+  ids: string[];
+  until: number;
+}
+
+async function mediaPut(storage: DoStorage, body: DoOp): Promise<{ ok: boolean }> {
+  const grant = copyMediaGrant(body.grant);
+  const now = body.now ?? Date.now();
+  if (!grant || grant.expiresAtMs <= now) return { ok: false };
+  await storage.put(`mediagrant:${grant.mediaId}`, grant);
+  const indexKey = `mediawake:${grant.wakeId}`;
+  const existing = await storage.get<MediaIndex>(indexKey);
+  const ids = existing && Array.isArray(existing.ids) ? existing.ids.filter((id) => typeof id === "string") : [];
+  if (!ids.includes(grant.mediaId)) ids.push(grant.mediaId);
+  const until = Math.max(grant.expiresAtMs, existing?.until ?? 0);
+  await storage.put<MediaIndex>(indexKey, { ids: ids.slice(-8), until });
+  await pruneMedia(storage, now);
+  return { ok: true };
+}
+
+async function mediaGet(storage: DoStorage, body: DoOp): Promise<{ grant: MediaGrant | null }> {
+  const now = body.now ?? Date.now();
+  const mediaId = body.mediaId ?? "";
+  await pruneMedia(storage, now);
+  const grant = copyMediaGrant(await storage.get<unknown>(`mediagrant:${mediaId}`));
+  if (!grant || grant.expiresAtMs <= now || grant.mediaId !== mediaId) {
+    if (mediaId) await storage.delete(`mediagrant:${mediaId}`);
+    return { grant: null };
+  }
+  return { grant };
+}
+
+async function mediaDeleteWake(storage: DoStorage, body: DoOp): Promise<{ ok: true }> {
+  if (!body.wakeId) return { ok: true };
+  const index = await storage.get<MediaIndex>(`mediawake:${body.wakeId}`);
+  for (const id of index?.ids ?? []) {
+    if (typeof id === "string") await storage.delete(`mediagrant:${id}`);
+  }
+  await storage.delete(`mediawake:${body.wakeId}`);
+  return { ok: true };
+}
+
+async function pruneMedia(storage: DoStorage, now: number): Promise<void> {
+  const grants = await storage.list<unknown>({ prefix: "mediagrant:", limit: PRUNE_BATCH });
+  for (const [key, value] of grants) {
+    const expiry = (value as { expiresAtMs?: unknown } | null)?.expiresAtMs;
+    if (typeof expiry !== "number" || expiry <= now) await storage.delete(key);
+  }
+  const indexes = await storage.list<unknown>({ prefix: "mediawake:", limit: PRUNE_BATCH });
+  for (const [key, value] of indexes) {
+    const until = (value as { until?: unknown } | null)?.until;
+    if (typeof until !== "number" || until <= now) await storage.delete(key);
+  }
 }
 
 async function sendFinish(storage: DoStorage, body: DoOp): Promise<{ ok: true }> {

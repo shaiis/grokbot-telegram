@@ -136,6 +136,7 @@ export async function handleSend(request: Request, deps: AppDeps): Promise<Respo
       if (auth.wakeId) {
         const remainingMs = Math.max(1000, auth.expiresAtMs - deps.now());
         await deps.store.closeWake(auth.wakeId, deps.now(), remainingMs);
+        await deps.store.deleteWakeMedia(chatId, auth.wakeId);
       }
     } catch (err) {
       deps.log({

@@ -33,6 +33,10 @@ export interface Config {
   fastGreeting: boolean;
   outboundApiKey: string | null;
   maxBodyBytes: number;
+  /** Voice and audio bytes served by GET /media. Clamped to the 20 MiB getFile limit. */
+  mediaMaxBytes: number;
+  /** Voice and audio duration, in seconds, above which no download is offered. */
+  mediaMaxDurationSeconds: number;
   dedupeTtlMs: number;
   allowInsecureWebhook: boolean;
   /** Names of settings that were present but rejected. Never contains values. */
@@ -74,6 +78,13 @@ function readBoundedInt(env: EnvSource, key: string, fallback: number, min: numb
 
 export const DEFAULT_PROGRESS_REACTION = "👀";
 export const DEFAULT_FORWARD_FAILURE_TEXT = "Sorry — I couldn't pick that up just now. Mind sending it again?";
+/** Default voice/audio download cap. Telegram's getFile limit is 20 MiB; we stay under it. */
+export const DEFAULT_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
+/** Official Bot API getFile ceiling. Configuration is never allowed above this. */
+export const ABSOLUTE_MEDIA_MAX_BYTES = 20 * 1024 * 1024;
+export const DEFAULT_MEDIA_MAX_DURATION_SECONDS = 5 * 60;
+/** Hard ceiling so a mis-set env value cannot request hour-long downloads. */
+export const ABSOLUTE_MEDIA_MAX_DURATION_SECONDS = 10 * 60;
 const DISABLED_VALUES = new Set(["off", "none", "false", "0", "no", "disabled"]);
 
 export function isAllowedReaction(emoji: string): boolean {
@@ -218,6 +229,14 @@ export function loadConfig(env: EnvSource): Config {
     fastGreeting: readBool(env, "FAST_GREETING"),
     outboundApiKey: outbound.length >= MIN_OUTBOUND_KEY_LENGTH ? outbound : null,
     maxBodyBytes: Math.max(1024, readInt(env, "MAX_BODY_BYTES", 1_000_000)),
+    mediaMaxBytes: readBoundedInt(env, "MEDIA_MAX_BYTES", DEFAULT_MEDIA_MAX_BYTES, 1024, ABSOLUTE_MEDIA_MAX_BYTES),
+    mediaMaxDurationSeconds: readBoundedInt(
+      env,
+      "MEDIA_MAX_DURATION_SECONDS",
+      DEFAULT_MEDIA_MAX_DURATION_SECONDS,
+      1,
+      ABSOLUTE_MEDIA_MAX_DURATION_SECONDS,
+    ),
     dedupeTtlMs: Math.max(1000, readInt(env, "DEDUPE_TTL_MS", 86_400_000)),
     allowInsecureWebhook,
     problems,

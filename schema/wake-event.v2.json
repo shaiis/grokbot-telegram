@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:grokbot-telegram:wake-event:v2",
   "title": "Grok Bot Telegram wake event",
-  "description": "JSON body this bridge POSTs to a Grok Bot routine webhook. schema_version is 2. Version 2 adds reply.heartbeat_url; everything else is unchanged from version 1.",
+  "description": "JSON body this bridge POSTs to a Grok Bot routine webhook. schema_version is 2. Version 2 adds reply.heartbeat_url. A later revision adds optional message.media_items for voice and audio; text wakes omit it. Download URLs are on this bridge and carry no Telegram bot token.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -53,6 +53,11 @@
         "date": { "type": ["integer", "null"] },
         "message_thread_id": { "type": ["integer", "null"] },
         "media": { "type": "array", "items": { "type": "string" } },
+        "media_items": {
+          "type": "array",
+          "description": "Present only for voice or audio. Omitted on text wakes. file ids and Telegram file URLs are never included.",
+          "items": { "$ref": "#/$defs/media_item" }
+        },
         "reply_to": {
           "type": ["object", "null"],
           "additionalProperties": false,
@@ -98,6 +103,22 @@
     }
   },
   "$defs": {
+    "media_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "mime_type", "file_name", "duration_seconds", "file_size", "available", "unavailable_reason", "download_url"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+        "kind": { "enum": ["voice", "audio"] },
+        "mime_type": { "type": ["string", "null"] },
+        "file_name": { "type": ["string", "null"], "maxLength": 64 },
+        "duration_seconds": { "type": ["integer", "null"], "minimum": 0 },
+        "file_size": { "type": ["integer", "null"], "minimum": 1 },
+        "available": { "type": "boolean" },
+        "unavailable_reason": { "type": ["string", "null"], "enum": ["too_large", "too_long", "unsupported_type", "bad_file", "unavailable", null] },
+        "download_url": { "type": ["string", "null"], "description": "GET this with Authorization: Bearer reply.token. Null when available is false." }
+      }
+    },
     "user": {
       "type": ["object", "null"],
       "additionalProperties": false,

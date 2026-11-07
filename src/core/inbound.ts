@@ -5,6 +5,7 @@ import { safeErrorMessage } from "./log.js";
 import { runInBackground, type AppDeps } from "./deps.js";
 import { forwardToGrok } from "./grok.js";
 import { json, readLimitedBody } from "./http.js";
+import { planWakeMedia } from "./media.js";
 import { buildWakeEvent, toContextMessage } from "./payload.js";
 import { MESSAGE_CLAIM_TTL_MS, rateChatKey, rateUserKey, scopeKey } from "./store.js";
 import { fastGreetingReply } from "./text.js";
@@ -200,6 +201,35 @@ async function handleClaimedUpdate(
 
   if (!await claimMessage(deps, update.update_id, chatId, message.message_id, edited, now)) return json(200, { ok: true });
 
+  const planned = planWakeMedia({
+    message,
+    config: deps.config,
+    chatId,
+    threadId,
+    userId,
+    wakeId: wake.reply.wake_id,
+    expiresAtMs: Date.parse(wake.reply.expires_at),
+  });
+  if (planned.items.length > 0) {
+    let items = planned.items;
+    if (planned.grants.length > 0) {
+      try {
+        for (const grant of planned.grants) await deps.store.putMedia(grant, now);
+      } catch (err) {
+        deps.log({
+          event: "media_grant_failed",
+          chat_id: chatId,
+          error: err instanceof Error ? err.name : "error",
+        });
+        items = planned.items.map((item) => item.available
+          ? { ...item, available: false, download_url: null, unavailable_reason: "unavailable" }
+          : item);
+        await deps.store.deleteWakeMedia(chatId, wake.reply.wake_id).catch(() => undefined);
+      }
+    }
+    wake.message.media_items = items;
+  }
+
   // Typing is pointless once the reply token has expired, so the ceiling never outlives it.
   const tokenExpiry = Date.parse(wake.reply.expires_at);
   const session: TypingStart = {
@@ -226,6 +256,7 @@ async function handleClaimedUpdate(
     user_id: userId,
     addressed_how: address.how,
     edited,
+    media_available: (wake.message.media_items ?? []).filter((item) => item.available).length,
   });
 
   runInBackground(deps, "wake_background_failed", () => deliverWake(deps, message, session, wake, chatId, threadId));
@@ -301,6 +332,10 @@ async function deliverWake(
     });
     return;
   }
+  // The routine did not accept the wake, so drop the file id instead of keeping it until the token expires.
+  await deps.store.deleteWakeMedia(chatId, wake.reply.wake_id).catch((err: unknown) => {
+    deps.log({ event: "media_revoke_failed", chat_id: chatId, error: err instanceof Error ? err.name : "error" });
+  });
   // Definitely not accepted, so nobody is going to reply. Do not leave typing or the reaction up.
   await deps.typing.stop(session.scopeKey, session.wakeId).catch(() => undefined);
   // deliverWake runs once per wake (update_id is deduped first), so this line is sent at most once.

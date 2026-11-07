@@ -2,6 +2,7 @@ import { configStatus } from "./config.js";
 import type { AppDeps } from "./deps.js";
 import { json, routePath } from "./http.js";
 import { handleWebhook } from "./inbound.js";
+import { handleMediaDownload, matchMediaPath } from "./media.js";
 import { handleSend, handleTypingHeartbeat, handleTypingStop } from "./outbound.js";
 
 export async function handleHealth(deps: AppDeps): Promise<Response> {
@@ -30,6 +31,11 @@ export async function handleRequest(request: Request, deps: AppDeps): Promise<Re
 async function route(request: Request, deps: AppDeps): Promise<Response> {
   const url = new URL(request.url);
   const path = routePath(url, deps.config.pathPrefix);
+  const mediaId = matchMediaPath(path);
+  if (mediaId) {
+    if (request.method !== "GET") return json(405, { ok: false, error: "method_not_allowed" });
+    return handleMediaDownload(request, deps, mediaId);
+  }
   if (request.method === "GET" || request.method === "HEAD") {
     if (path === "/healthz") {
       const response = await handleHealth(deps);

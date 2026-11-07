@@ -98,6 +98,25 @@ export interface ReplyTo {
   from: PublicUser | null;
 }
 
+/** Why a voice or audio item has no download. Safe to show to the routine. */
+export type MediaUnavailableReason = "too_large" | "too_long" | "unsupported_type" | "bad_file" | "unavailable";
+
+/**
+ * Voice or audio the routine may download from this bridge.
+ * No Telegram file id and no Telegram file URL.
+ */
+export interface MediaItem {
+  id: string;
+  kind: "voice" | "audio";
+  mime_type: string | null;
+  file_name: string | null;
+  duration_seconds: number | null;
+  file_size: number | null;
+  available: boolean;
+  unavailable_reason: MediaUnavailableReason | null;
+  download_url: string | null;
+}
+
 export interface WakeReply {
   token: string;
   expires_at: string;
@@ -131,6 +150,8 @@ export interface WakeEvent {
     date: number | null;
     message_thread_id: number | null;
     media: string[];
+    /** Present only when the message has a voice or audio file. Text wakes omit it. */
+    media_items?: MediaItem[];
     reply_to: ReplyTo | null;
   };
   short_term: ContextMessage[];

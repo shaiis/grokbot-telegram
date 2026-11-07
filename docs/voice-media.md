@@ -121,7 +121,10 @@ An outbound API key cannot download media. The bearer is the wake's reply token.
 | `getfile_http_<status>` | `getFile` returned that HTTP status. `<status>` is three digits. |
 | `download_http_<status>` | The file download returned that HTTP status. |
 | `getfile_redirect`, `download_redirect` | Telegram answered with a redirect. It is not followed. |
-| `getfile_unreachable`, `download_unreachable` | The fetch threw before a status was available. |
+| `getfile_unreachable`, `download_unreachable` | The fetch threw, and the error was not one of the known workerd cases below. |
+| `getfile_reset`, `download_reset` | Workerd reported `Network connection lost.` The file download is tried once more. |
+| `getfile_timeout`, `download_timeout` | The fetch hit its timeout. The file download is tried once more. |
+| `getfile_bad_content_length`, `download_bad_content_length` | Workerd rejected the response `Content-Length` (including a repeated value). Not retried. |
 | `getfile_bad_response` | `getFile` returned 2xx without a File object. |
 | `getfile_bad_size` | `file_size` was present and not a positive integer. |
 | `bad_path` | `file_path` was not a relative Telegram path. |
@@ -157,6 +160,6 @@ After a rollback, new wakes no longer include `media_items`. `/send` and typing 
 
 ## What was verified here
 
-Verified with Vitest against a mocked Telegram `getFile` and file download: text wakes unchanged, a voice wake's download contract, a realistic voice response (`voice/file_N.oga`, `application/octet-stream`, body starting `OggS`, with and without `content-length`), Durable Object grant storage, the Vercel `/media/:id` path, expired and finalized tokens, wrong chat, topic, wake, and media id, allowlist removal, size and duration caps, missing and oversized content length, MIME and magic-byte rejection, redirect and path refusal, HTTP status reason codes, and transport errors that do not echo secrets.
+Verified with Vitest and with workerd (Miniflare, compatibility date 2026-01-15): text wakes unchanged, a voice wake's download contract, a realistic voice response (`voice/file_N.oga`, `application/octet-stream`, body starting `OggS`), Durable Object grant storage, one final send, grant close, a fetch function that rejects a wrong `this` value, a reset on the first file connection, and a repeated `Content-Length`. A fake-token `getFile` through workerd to `api.telegram.org` returns `getfile_http_401`. The Hebrew transcription runner was not run here.
 
 Not done from this environment: no request to the production Worker, no live Telegram voice note, no call to `/workspace/telegram-voice-test/run.sh` (that runner is on the bot computer and is not in this VM).

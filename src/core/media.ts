@@ -276,6 +276,12 @@ type MediaFailureCode =
   | "download_redirect"
   | "getfile_unreachable"
   | "download_unreachable"
+  | "getfile_reset"
+  | "download_reset"
+  | "getfile_timeout"
+  | "download_timeout"
+  | "getfile_bad_content_length"
+  | "download_bad_content_length"
   | "bad_path"
   | "getfile_bad_response"
   | "getfile_bad_size"
@@ -306,6 +312,23 @@ function mediaFailureReason(failure: MediaFailure): string {
   return failure.code;
 }
 
+/**
+ * Workerd's fetch throws instead of returning a response for a few cases.
+ * Only these exact names and messages are mapped. Anything else stays
+ * `*_unreachable`, and the raw message is never returned or logged because it
+ * can contain the request URL.
+ */
+function thrownFetchCode(err: unknown, which: "getfile" | "download"): MediaFailureCode {
+  const name = err instanceof Error ? err.name : "";
+  const message = err instanceof Error ? err.message : "";
+  if (name === "TimeoutError") return which === "getfile" ? "getfile_timeout" : "download_timeout";
+  if (message === "Network connection lost.") return which === "getfile" ? "getfile_reset" : "download_reset";
+  if (message.startsWith("invalid Content-Length header value")) {
+    return which === "getfile" ? "getfile_bad_content_length" : "download_bad_content_length";
+  }
+  return which === "getfile" ? "getfile_unreachable" : "download_unreachable";
+}
+
 async function downloadTelegramAudio(options: {
   token: string;
   fileId: string;
@@ -320,16 +343,29 @@ async function downloadTelegramAudio(options: {
   const path = sanitizeTelegramFilePath(meta.filePath);
   const url = path ? telegramFileUrl(options.token, path) : null;
   if (!url) return failed("bad_path");
-  let response: Response;
-  try {
-    response = await options.fetchImpl(url, {
-      method: "GET",
-      redirect: "manual",
-      signal: AbortSignal.timeout(20_000),
-    });
-  } catch {
-    return failed("download_unreachable");
+  // Call fetch as a function. `options.fetchImpl(...)` sets `this` to `options`,
+  // and workerd's fetch then throws TypeError "Illegal invocation". getFile already
+  // calls the same function bare, which is why only the file download failed.
+  const fetchImpl = options.fetchImpl;
+  let response: Response | null = null;
+  let failure: MediaFailure = { code: "download_unreachable" };
+  // A dropped connection or a timeout is retried once. A bad header is not:
+  // the same response would throw again, and retrying would hide it.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      response = await fetchImpl(url, {
+        method: "GET",
+        redirect: "manual",
+        signal: AbortSignal.timeout(20_000),
+      });
+      break;
+    } catch (err) {
+      failure = { code: thrownFetchCode(err, "download") };
+      const retryable = failure.code === "download_reset" || failure.code === "download_timeout";
+      if (!retryable || attempt === 1) return { ok: false, failure };
+    }
   }
+  if (!response) return { ok: false, failure };
   if (response.status >= 300 && response.status < 400) {
     await response.body?.cancel().catch(() => undefined);
     return failed("download_redirect");
@@ -368,8 +404,8 @@ async function telegramGetFile(
       body: JSON.stringify({ file_id: fileId }),
       signal: AbortSignal.timeout(10_000),
     });
-  } catch {
-    return failed("getfile_unreachable");
+  } catch (err) {
+    return failed(thrownFetchCode(err, "getfile"));
   }
   if (response.status >= 300 && response.status < 400) {
     await response.body?.cancel().catch(() => undefined);

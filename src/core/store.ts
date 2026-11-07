@@ -1,3 +1,4 @@
+import { ABSOLUTE_MEDIA_MAX_BYTES, ABSOLUTE_MEDIA_MAX_DURATION_SECONDS } from "./config.js";
 import type { ContextMessage, TypingScope } from "./types.js";
 import { scopeDeadline } from "./typing.js";
 
@@ -33,6 +34,103 @@ export interface Store {
   /** Drop a claim after a send that definitely did not go out, so it can be tried again. */
   releaseSend(key: string): Promise<void>;
   isWakeClosed(wakeId: string, now: number): Promise<boolean>;
+  /**
+   * Remember a Telegram file id for one wake. The id never leaves the bridge.
+   * `now` drops grants that have already expired.
+   */
+  putMedia(grant: MediaGrant, now: number): Promise<void>;
+  /** The grant for this chat and media id, or null when it is missing, expired, or for another chat. */
+  getMedia(chatId: string, mediaId: string, now: number): Promise<MediaGrant | null>;
+  deleteMedia(chatId: string, mediaId: string): Promise<void>;
+  /** Drop every media grant for one wake. Used when the final reply is delivered or the forward fails. */
+  deleteWakeMedia(chatId: string, wakeId: string): Promise<void>;
+}
+
+/**
+ * Server-side permission to pull one Telegram voice or audio file.
+ * `fileId` is the Bot API file_id. It stays in the store and is never put on the wake.
+ */
+export interface MediaGrant {
+  mediaId: string;
+  wakeId: string;
+  chatId: string;
+  userId: string | null;
+  threadId: number | null;
+  kind: "voice" | "audio";
+  fileId: string;
+  mimeType: string | null;
+  fileName: string | null;
+  durationSeconds: number | null;
+  fileSize: number | null;
+  expiresAtMs: number;
+}
+
+const MEDIA_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const MAX_MEDIA_GRANTS = 200;
+
+function isCanonicalStoredId(value: string): boolean {
+  if (!/^-?(?:0|[1-9]\d*)$/.test(value)) return false;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed !== 0;
+}
+
+/** Telegram file_id, kept opaque. Reject path and URL shapes so it cannot be turned into a request URL. */
+export function isTelegramFileId(value: string): boolean {
+  if (value.length < 8 || value.length > 512) return false;
+  if (!/^[\x21-\x7e]+$/.test(value)) return false;
+  if (/["\\%<>]/.test(value)) return false;
+  const lower = value.toLowerCase();
+  return !lower.includes("..") && !lower.includes("://") && !lower.includes("%2e") && !lower.includes("%2f");
+}
+
+/** Copy a grant field by field. Returns null when any field is missing or unsafe. */
+export function copyMediaGrant(value: unknown): MediaGrant | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const mediaId = record.mediaId;
+  const wakeId = record.wakeId;
+  const chatId = record.chatId;
+  const fileId = record.fileId;
+  const kind = record.kind;
+  const expiresAtMs = record.expiresAtMs;
+  if (typeof mediaId !== "string" || !MEDIA_ID.test(mediaId)) return null;
+  if (typeof wakeId !== "string" || wakeId.length < 1 || wakeId.length > 80) return null;
+  if (typeof chatId !== "string" || !isCanonicalStoredId(chatId)) return null;
+  if (typeof fileId !== "string" || !isTelegramFileId(fileId)) return null;
+  if (kind !== "voice" && kind !== "audio") return null;
+  if (typeof expiresAtMs !== "number" || !Number.isFinite(expiresAtMs)) return null;
+  const userId = record.userId;
+  if (userId !== null && (typeof userId !== "string" || !isCanonicalStoredId(userId))) return null;
+  const threadId = record.threadId;
+  if (threadId !== null && (typeof threadId !== "number" || !Number.isSafeInteger(threadId))) return null;
+  const mimeType = record.mimeType;
+  if (mimeType !== null && (typeof mimeType !== "string" || !/^audio\/[a-z0-9.+-]{1,64}$/.test(mimeType))) return null;
+  const fileName = record.fileName;
+  if (fileName !== null && (typeof fileName !== "string" || fileName.length < 1 || fileName.length > 64 || /[/\\]/.test(fileName) || fileName.includes(".."))) {
+    return null;
+  }
+  const durationSeconds = record.durationSeconds;
+  if (durationSeconds !== null && (typeof durationSeconds !== "number" || !Number.isSafeInteger(durationSeconds) || durationSeconds < 0 || durationSeconds > ABSOLUTE_MEDIA_MAX_DURATION_SECONDS)) {
+    return null;
+  }
+  const fileSize = record.fileSize;
+  if (fileSize !== null && (typeof fileSize !== "number" || !Number.isSafeInteger(fileSize) || fileSize < 1 || fileSize > ABSOLUTE_MEDIA_MAX_BYTES)) {
+    return null;
+  }
+  return {
+    mediaId,
+    wakeId,
+    chatId,
+    userId,
+    threadId,
+    kind,
+    fileId,
+    mimeType,
+    fileName,
+    durationSeconds,
+    fileSize,
+    expiresAtMs,
+  };
 }
 
 /**
@@ -118,6 +216,7 @@ export class MemoryStore implements Store {
   private readonly typing = new Map<string, TypingScope>();
   private readonly closedWakes = new Map<string, number>();
   private readonly sends = new Map<string, { until: number; record: SendRecord }>();
+  private readonly media = new Map<string, MediaGrant>();
 
   async claimUpdate(updateId: number, now: number, ttlMs: number): Promise<"new" | "duplicate"> {
     this.pruneUpdates(now);
@@ -226,6 +325,41 @@ export class MemoryStore implements Store {
     this.sends.delete(key);
   }
 
+  async putMedia(grant: MediaGrant, now: number): Promise<void> {
+    const clean = copyMediaGrant(grant);
+    if (!clean || clean.expiresAtMs <= now) throw new Error("bad_media_grant");
+    this.pruneMedia(now);
+    this.media.delete(clean.mediaId);
+    this.media.set(clean.mediaId, clean);
+    while (this.media.size > MAX_MEDIA_GRANTS) {
+      const oldest = this.media.keys().next().value;
+      if (oldest === undefined) break;
+      this.media.delete(oldest);
+    }
+  }
+
+  async getMedia(chatId: string, mediaId: string, now: number): Promise<MediaGrant | null> {
+    const found = this.media.get(mediaId);
+    if (!found) return null;
+    if (found.expiresAtMs <= now) {
+      this.media.delete(mediaId);
+      return null;
+    }
+    if (found.chatId !== chatId) return null;
+    return copyMediaGrant(found);
+  }
+
+  async deleteMedia(chatId: string, mediaId: string): Promise<void> {
+    const found = this.media.get(mediaId);
+    if (found && found.chatId === chatId) this.media.delete(mediaId);
+  }
+
+  async deleteWakeMedia(chatId: string, wakeId: string): Promise<void> {
+    for (const [id, grant] of this.media) {
+      if (grant.chatId === chatId && grant.wakeId === wakeId) this.media.delete(id);
+    }
+  }
+
   private pruneUpdates(now: number): void {
     for (const [id, expiry] of this.updates) {
       if (expiry <= now) this.updates.delete(id);
@@ -235,6 +369,12 @@ export class MemoryStore implements Store {
   private pruneWakes(now: number): void {
     for (const [id, expiry] of this.closedWakes) {
       if (expiry <= now) this.closedWakes.delete(id);
+    }
+  }
+
+  private pruneMedia(now: number): void {
+    for (const [id, grant] of this.media) {
+      if (grant.expiresAtMs <= now) this.media.delete(id);
     }
   }
 }

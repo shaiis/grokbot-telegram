@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canonicalId, fatalConfigProblems, loadConfig, normalizePublicBaseUrl } from "../src/core/config.js";
+import { ABSOLUTE_MEDIA_MAX_BYTES, canonicalId, fatalConfigProblems, loadConfig, normalizePublicBaseUrl } from "../src/core/config.js";
 import { handleRequest } from "../src/core/handler.js";
 import { createTestApp, dmUpdate, postUpdate, testEnv } from "./helpers.js";
 
@@ -51,6 +51,16 @@ describe("key length floors", () => {
       body: JSON.stringify({ chat_id: "-500", text: "proactive" }),
     }), app.deps);
     expect(response.status).toBe(401);
+  });
+});
+
+describe("media caps", () => {
+  it("defaults to 10 MiB and 5 minutes and never accepts a size above the 20 MiB getFile limit", () => {
+    const config = loadConfig(testEnv());
+    expect(config.mediaMaxBytes).toBe(10 * 1024 * 1024);
+    expect(config.mediaMaxDurationSeconds).toBe(300);
+    expect(loadConfig(testEnv({ MEDIA_MAX_BYTES: "999999999" })).mediaMaxBytes).toBe(ABSOLUTE_MEDIA_MAX_BYTES);
+    expect(loadConfig(testEnv({ MEDIA_MAX_DURATION_SECONDS: "86400" })).mediaMaxDurationSeconds).toBe(600);
   });
 });
 

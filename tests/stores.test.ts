@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { handleDoFetch } from "../src/adapters/cloudflare/do-storage.js";
-import { MemoryStore, scopeKey } from "../src/core/store.js";
+import { copyMediaGrant, MemoryStore, scopeKey, type MediaGrant } from "../src/core/store.js";
 import type { ContextMessage, TypingScope } from "../src/core/types.js";
 import { memoryStorage, testEnv } from "./helpers.js";
 
@@ -82,6 +82,51 @@ describe("durable object dedupe storage", () => {
     await op(storage, { op: "context", scopeKey: "chat:1:thread:root", message: ctx(1, 1_000_000), limit: 10 });
     const result = await op(storage, { op: "context", scopeKey: "chat:1:thread:root", message: ctx(2, 1_000_000 + 8 * day), limit: 10 });
     expect(result.prior).toEqual([]);
+  });
+});
+
+function sampleGrant(overrides: Partial<MediaGrant> = {}): MediaGrant {
+  return {
+    mediaId: "11111111-1111-4111-8111-111111111111",
+    wakeId: "wake-1",
+    chatId: "42",
+    userId: "42",
+    threadId: null,
+    kind: "voice",
+    fileId: "AwACAgIAAxkBVOICEFILEID0123456789",
+    mimeType: "audio/ogg",
+    fileName: null,
+    durationSeconds: 16,
+    fileSize: 48000,
+    expiresAtMs: 5_000,
+    ...overrides,
+  };
+}
+
+describe("media grants", () => {
+  it("stores a grant for one chat and drops it on expiry, deletion, and wake close", async () => {
+    const store = new MemoryStore();
+    await store.putMedia(sampleGrant(), 1_000);
+    expect(await store.getMedia("42", sampleGrant().mediaId, 1_000)).toMatchObject({ fileId: sampleGrant().fileId });
+    expect(await store.getMedia("-500", sampleGrant().mediaId, 1_000)).toBeNull();
+    expect(await store.getMedia("42", sampleGrant().mediaId, 5_000)).toBeNull();
+    await store.putMedia(sampleGrant({ expiresAtMs: 9_000 }), 1_000);
+    await store.deleteWakeMedia("42", "wake-1");
+    expect(await store.getMedia("42", sampleGrant().mediaId, 1_000)).toBeNull();
+    expect(copyMediaGrant({ ...sampleGrant(), fileId: "https://evil.example/a" })).toBeNull();
+    expect(copyMediaGrant({ ...sampleGrant(), fileId: "../etc/passwd" })).toBeNull();
+  });
+
+  it("round-trips a grant through durable object storage and prunes it when the wake ends", async () => {
+    const storage = memoryStorage();
+    const grant = sampleGrant();
+    expect(await op(storage, { op: "media.put", grant, now: 1_000 })).toEqual({ ok: true });
+    expect(await op(storage, { op: "media.get", mediaId: grant.mediaId, now: 1_000 })).toEqual({ grant });
+    expect(await op(storage, { op: "media.put", grant: { ...grant, fileId: "https://evil.example/file" }, now: 1_000 })).toEqual({ ok: false });
+    await op(storage, { op: "media.deleteWake", wakeId: grant.wakeId });
+    expect(await op(storage, { op: "media.get", mediaId: grant.mediaId, now: 1_100 })).toEqual({ grant: null });
+    await op(storage, { op: "media.put", grant, now: 1_000 });
+    expect(await op(storage, { op: "media.get", mediaId: grant.mediaId, now: 9_000 })).toEqual({ grant: null });
   });
 });
 

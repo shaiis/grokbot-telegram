@@ -1,5 +1,5 @@
 import type { ContextMessage } from "../../core/types.js";
-import { chatIdFromRateKey, chatIdFromScope, normalizeSendRecord, type Store } from "../../core/store.js";
+import { chatIdFromRateKey, chatIdFromScope, copyMediaGrant, normalizeSendRecord, type Store } from "../../core/store.js";
 import { normalizeScope, type TypingController } from "../../core/typing.js";
 
 export interface DoId {
@@ -96,6 +96,22 @@ export function createDurableBackend(namespace: DoNamespace): { store: Store; ty
     },
     async releaseSend(key) {
       await call(namespace, "dedupe", { op: "send.release", sendKey: key });
+    },
+    async putMedia(grant, now) {
+      const result = await call(namespace, chatObjectName(grant.chatId), { op: "media.put", grant, now });
+      if (result.ok !== true) throw new Error("media_grant_rejected");
+    },
+    async getMedia(chatId, mediaId, now) {
+      const result = await call(namespace, chatObjectName(chatId), { op: "media.get", mediaId, now });
+      const grant = copyMediaGrant(result.grant);
+      if (!grant || grant.chatId !== chatId) return null;
+      return grant;
+    },
+    async deleteMedia(chatId, mediaId) {
+      await call(namespace, chatObjectName(chatId), { op: "media.delete", mediaId });
+    },
+    async deleteWakeMedia(chatId, wakeId) {
+      await call(namespace, chatObjectName(chatId), { op: "media.deleteWake", wakeId });
     },
   };
 

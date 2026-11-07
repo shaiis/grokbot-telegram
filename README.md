@@ -116,7 +116,7 @@ Write the deployment origin into `PUBLIC_BASE_URL` in `.env`. In the Vercel dash
 npx vercel --prod
 ```
 
-`vercel.json` rewrites `/webhook`, `/send`, `/typing/stop`, `/typing/heartbeat`, and `/healthz` to `api/index.ts`. Leave `PATH_PREFIX` empty.
+`vercel.json` rewrites `/webhook`, `/send`, `/typing/stop`, `/typing/heartbeat`, `/healthz`, and `/media/:mediaId` to `api/index.ts`. Leave `PATH_PREFIX` empty.
 
 ### Node
 
@@ -176,6 +176,8 @@ curl -sS -X POST "$SEND_URL" \
 
 The token lasts `REPLY_TOKEN_TTL_SECONDS` (30 minutes by default). It works for several sends until the final one, so the assistant can send a progress line and then the answer. It is valid only for its chat and topic. Use a different `REPLY_TOKEN_SECRET` for every bridge, because every bridge that shares a secret accepts the same tokens.
 
+A private voice note, or a group voice note sent as a reply to the bot, adds optional `message.media_items`. Text wakes omit that field. The routine downloads the bytes from `download_url` with the same bearer token, before `"final": true`. The bridge holds the bot token and calls Telegram `getFile` itself. See [Voice and audio](docs/voice-media.md).
+
 `/send` keeps each answer to one Telegram message:
 
 - **One final per wake.** A repeated `"final": true` after delivery returns `200 {"ok": true, "already_sent": true, "message_ids": [...]}`. The record lasts as long as the token. When two finals race, one sends and the other gets `409 {"ok": false, "ambiguous": true, "error": "send_in_progress"}`.
@@ -186,7 +188,7 @@ The token lasts `REPLY_TOKEN_TTL_SECONDS` (30 minutes by default). It works for 
 
 | Host | Typing indicator | Dedupe and state |
 | --- | --- | --- |
-| **Cloudflare Workers** (recommended) | A Durable Object alarm refreshes typing every 3 seconds while any wake in the chat holds its lease. Wakes survive eviction and restarts. | Durable Object storage. The `dedupe` object claims each `update_id` and holds `/send` records. Each chat's object claims each message and holds context, rate limits, and typing. |
+| **Cloudflare Workers** (recommended) | A Durable Object alarm refreshes typing every 3 seconds while any wake in the chat holds its lease. Wakes survive eviction and restarts. | Durable Object storage. The `dedupe` object claims each `update_id` and holds `/send` records. Each chat's object claims each message and holds context, rate limits, typing, and voice/audio grants. |
 | **Vercel** | One typing action when the wake starts and one after each progress line. Telegram shows each for about 5 seconds. The 👀 stays until the answer. | The memory of that instance. |
 | **Node** | An in-process timer refreshes typing every 3 seconds until the final send, `/typing/stop`, a failed forward, or the end of the lease. | The memory of that process. |
 
@@ -194,7 +196,7 @@ On Vercel and Node, dedupe state lasts as long as the process. A Telegram retry 
 
 Cloudflare, Vercel, Fly.io, Railway, Render, and a VPS load the gitignored `.env`. The commands are in [Setup](#setup). `npm run set-webhook` and `npm run set-commands` read that file on every host. Local `wrangler dev` reads it too. Wrangler reads `.dev.vars` when that file exists, so keep the setup values in `.env` alone.
 
-Vercel serves `/webhook`, `/send`, `/typing/stop`, `/typing/heartbeat`, and `/healthz` from one function, `api/index.ts`, so every route shares that instance's memory. The 👀 clears when the final answer reaches the instance that took the message. The team Environment Variables page is where Vercel loads `.env`. The next `npx vercel --prod` deploys those values.
+Vercel serves `/webhook`, `/send`, `/typing/stop`, `/typing/heartbeat`, `/healthz`, and `/media/:mediaId` from one function, `api/index.ts`, so every route shares that instance's memory. The 👀 clears when the final answer reaches the instance that took the message. The team Environment Variables page is where Vercel loads `.env`. The next `npx vercel --prod` deploys those values.
 
 On Node, `npm start` reads `.env` and listens on `PORT` (default `8080`). Fly.io loads the file with `fly secrets import < .env`. Railway loads it through the Variables RAW Editor. Render loads it by pointing the service environment at `.env`. A VPS loads it by keeping `.env` next to the code.
 

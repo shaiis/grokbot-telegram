@@ -4,6 +4,7 @@
     { "source": "/webhook", "destination": "/api?path=/webhook" },
     { "source": "/send", "destination": "/api?path=/send" },
     { "source": "/typing/stop", "destination": "/api?path=/typing/stop" },
-    { "source": "/typing/heartbeat", "destination": "/api?path=/typing/heartbeat" }
+    { "source": "/typing/heartbeat", "destination": "/api?path=/typing/heartbeat" },
+    { "source": "/media/:mediaId", "destination": "/api?path=/media/:mediaId" }
   ]
 }
